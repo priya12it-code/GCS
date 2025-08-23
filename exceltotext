@@ -1,0 +1,125 @@
+# schemafit_back.py
+import sys
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
+import pandas as pd
+from openpyxl import load_workbook
+
+PIPE = "|"
+
+# ---------- schema ----------
+def read_schema(schema_path: Path) -> Tuple[List[str], List[int], Dict[str, int]]:
+    """
+    Read d5.xlsx -> (headers, lengths, map) where:
+      - headers from row 1; blank/NAN headers become col1, col2, ...
+      - lengths from row 2 (ints)
+      - map: {header -> length}
+    """
+    df = pd.read_excel(schema_path, header=None)
+    if len(df) < 2:
+        raise ValueError("Schema must have 2 rows: headers (row1) and lengths (row2).")
+
+    raw_headers = df.iloc[0].tolist()
+    raw_lengths = df.iloc[1].tolist()
+
+    headers: List[str] = []
+    for i, h in enumerate(raw_headers, start=1):
+        txt = "" if h is None else str(h).strip()
+        headers.append(f"col{i}" if txt == "" or txt.lower() == "nan" else txt)
+
+    lengths: List[int] = [int(float(x)) for x in raw_lengths]
+    h2len = {h: L for h, L in zip(headers, lengths)}
+    return headers, lengths, h2len
+
+# ---------- helpers ----------
+def ensure_width(value: Optional[str], width: int) -> str:
+    """Return value as str, truncated or RIGHT-padded with spaces to exactly width."""
+    s = "" if value is None else str(value)
+    if len(s) > width:
+        return s[:width]
+    if len(s) < width:
+        return s + (" " * (width - len(s)))
+    return s
+
+def row_is_blank(values: List[Optional[str]]) -> bool:
+    """True if all values are empty/None (ignoring spaces)."""
+    for v in values:
+        if v is not None and str(v).strip() != "":
+            return False
+    return True
+
+# ---------- main conversion ----------
+def excel_to_text_one(xlsx_path: Path, headers: List[str], lengths: List[int], h2len: Dict[str, int]) -> Path:
+    """
+    - Remove 'Lengths' sheet if present
+    - Read 'Sheet1' and write <stem>.txt with pipe delimiter
+    - Apply exact widths from schema by header name (fallback to position)
+    """
+    wb = load_workbook(xlsx_path)
+    # Step 1: remove "Lengths" sheet if present
+    if "Lengths" in wb.sheetnames:
+        del wb["Lengths"]
+        wb.save(xlsx_path)
+
+    # Step 2: convert Sheet1 -> text
+    sheet_name = "Sheet1" if "Sheet1" in wb.sheetnames else wb.sheetnames[0]
+    ws = wb[sheet_name]
+
+    # Determine column order from header row (row 1)
+    sheet_headers: List[str] = []
+    for c in range(1, ws.max_column + 1):
+        sheet_headers.append("" if ws.cell(row=1, column=c).value is None else str(ws.cell(row=1, column=c).value).strip())
+
+    # Build per-column widths using header names; fallback to positional widths
+    per_col_widths: List[int] = []
+    for idx, name in enumerate(sheet_headers):
+        if name in h2len:
+            per_col_widths.append(h2len[name])
+        elif idx < len(lengths):
+            per_col_widths.append(lengths[idx])
+        else:
+            per_col_widths.append(0)  # should not happen; safe fallback
+
+    # Number of columns we will write equals the number of headers from the sheet
+    ncols = len(sheet_headers)
+
+    out_lines: List[str] = []
+    for r in range(2, ws.max_row + 1):  # start after header row
+        raw_values = [ws.cell(row=r, column=c).value for c in range(1, ncols + 1)]
+        if row_is_blank(raw_values):
+            continue  # skip completely blank rows
+
+        fixed_values: List[str] = [
+            ensure_width(raw_values[c - 1], per_col_widths[c - 1]) for c in range(1, ncols + 1)
+        ]
+        # Join with pipes; include trailing pipe to match original style
+        out_lines.append(PIPE.join(fixed_values) + PIPE)
+
+    txt_path = xlsx_path.with_suffix(".txt")
+    txt_path.write_text("\n".join(out_lines), encoding="utf-8")
+    return txt_path
+
+def process_folder(folder: str) -> None:
+    folder_path = Path(folder)
+    schema_path = folder_path / "d5.xlsx"
+    if not schema_path.exists():
+        raise FileNotFoundError(f"Missing schema file: {schema_path}")
+
+    headers, lengths, h2len = read_schema(schema_path)
+
+    # All .xlsx except d5.xlsx
+    xlsx_files = sorted(p for p in folder_path.glob("*.xlsx") if p.name.lower() != "d5.xlsx")
+    if not xlsx_files:
+        print(f"No Excel files found in {folder_path} (besides d5.xlsx).")
+        return
+
+    for xlsx in xlsx_files:
+        txt_out = excel_to_text_one(xlsx, headers, lengths, h2len)
+        print(f"Converted: {xlsx.name}  →  {txt_out.name}")
+
+if __name__ == "__main__":
+    # Usage: python schemafit_back.py ABC
+    if len(sys.argv) != 2:
+        print("Usage: python schemafit_back.py <folder_with_excels_and_d5.xlsx>")
+        sys.exit(1)
+    process_folder(sys.argv[1])
