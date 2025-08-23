@@ -1,0 +1,137 @@
+import sys
+from pathlib import Path
+from typing import List, Tuple
+import shutil
+from datetime import datetime
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
+
+PIPE = "|"
+
+# -------- Schema --------
+def read_schema(schema_path: Path) -> Tuple[List[str], List[int]]:
+    df = pd.read_excel(schema_path, header=None)
+    if len(df) < 2:
+        raise ValueError("Schema must have 2 rows: headers (row1) and lengths (row2).")
+
+    raw_headers = df.iloc[0].tolist()
+    raw_lengths = df.iloc[1].tolist()
+
+    headers: List[str] = []
+    for i, h in enumerate(raw_headers, start=1):
+        txt = "" if h is None else str(h).strip()
+        headers.append(f"col{i}" if txt == "" or txt.lower() == "nan" else txt)
+
+    lengths: List[int] = [int(float(x)) for x in raw_lengths]
+    return headers, lengths
+
+# -------- Data read --------
+def read_pipe_rows(txt_path: Path) -> List[List[str]]:
+    rows: List[List[str]] = []
+    with open(txt_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = [p.strip() for p in line.rstrip("\n").split(PIPE)]
+            rows.append(parts)
+    return rows
+
+# -------- Transform --------
+def pad_trim_to_lengths(rows: List[List[str]], lengths: List[int]) -> List[List[str]]:
+    ncols = len(lengths)
+    out: List[List[str]] = []
+    for r in rows:
+        r = (r + [""] * ncols)[:ncols]
+        fixed = []
+        for i, val in enumerate(r):
+            s = "" if val is None else str(val)
+            if len(s) > lengths[i]:
+                s = s[:lengths[i]]
+            elif len(s) < lengths[i]:
+                s = s + (" " * (lengths[i] - len(s)))
+            fixed.append(s)
+        out.append(fixed)
+    return out
+
+def compute_length_matrix(matrix: List[List[str]]) -> List[List[int]]:
+    return [[len(x) for x in row] for row in matrix]
+
+# -------- Write Excel (OpenPyXL) --------
+def write_excel_with_lengths(out_path: Path, headers: List[str], matrix: List[List[str]], lengths: List[int]) -> None:
+    wb = Workbook()
+    ws_data = wb.active
+    ws_data.title = "Sheet1"
+    ws_len = wb.create_sheet("Lengths")
+
+    mono = Font(name="Consolas")
+
+    # Data sheet
+    for c, h in enumerate(headers, start=1):
+        cell = ws_data.cell(row=1, column=c, value=h)
+        cell.font = mono
+        cell.alignment = Alignment(horizontal="left")
+
+    for r, row in enumerate(matrix, start=2):
+        for c, value in enumerate(row, start=1):
+            cell = ws_data.cell(row=r, column=c, value=value)
+            cell.number_format = "@"
+            cell.font = mono
+            cell.alignment = Alignment(horizontal="left")
+
+    for i, L in enumerate(lengths, start=1):
+        ws_data.column_dimensions[get_column_letter(i)].width = min(max(L, 10), 255)
+
+    # Lengths sheet
+    for c, h in enumerate(headers, start=1):
+        ws_len.cell(row=1, column=c, value=h).font = mono
+    ws_len.cell(row=1, column=len(headers)+1, value="AllMatch").font = mono
+
+    for c, L in enumerate(lengths, start=1):
+        ws_len.cell(row=2, column=c, value=L)
+
+    len_matrix = compute_length_matrix(matrix)
+    for r, len_row in enumerate(len_matrix, start=3):
+        all_match = all(len_row[i] == lengths[i] for i in range(len(lengths)))
+        for c, v in enumerate(len_row, start=1):
+            ws_len.cell(row=r, column=c, value=v)
+        ws_len.cell(row=r, column=len(headers)+1, value=all_match)
+
+    wb.save(out_path)
+
+# -------- Archive --------
+def archive_text_file(txt_path: Path, archive_dir: Path) -> Path:
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = archive_dir / f"{txt_path.stem}_{ts}{txt_path.suffix}"
+    return Path(shutil.move(str(txt_path), str(target)))
+
+# -------- Main --------
+def process_folder(folder: str) -> None:
+    folder_path = Path(folder)
+    schema_path = folder_path / "d5.xlsx"
+    if not schema_path.exists():
+        raise FileNotFoundError(f"Missing schema file: {schema_path}")
+
+    headers, lengths = read_schema(schema_path)
+
+    txt_files = sorted(folder_path.glob("*.txt"))
+    if not txt_files:
+        print(f"No .txt files found in {folder_path}")
+        return
+
+    archive_dir = folder_path / "archive"
+
+    for txt in txt_files:
+        rows = read_pipe_rows(txt)
+        matrix = pad_trim_to_lengths(rows, lengths)
+        out_xlsx = txt.with_suffix(".xlsx")  # data.xlsx, data1.xlsx, ...
+        write_excel_with_lengths(out_xlsx, headers, matrix, lengths)
+        moved = archive_text_file(txt, archive_dir)
+        print(f"Wrote: {out_xlsx.resolve()}  |  Archived: {moved.name}")
+
+if __name__ == "__main__":
+    # Usage: python schemafit.py ABC
+    if len(sys.argv) != 2:
+        print("Usage: python schemafit.py <folder_with_d5_and_txt_files>")
+        sys.exit(1)
+    process_folder(sys.argv[1])
